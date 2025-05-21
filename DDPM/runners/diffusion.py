@@ -5,6 +5,13 @@ import pickle
 import random
 import time
 
+from DDPM.medical_diffusion.models.pipelines.diffusion_pipeline import DiffusionPipeline
+from medical_diffusion.models.embedders.latent_embedders import VAE
+from medical_diffusion.models.estimators import UNet
+from medical_diffusion.models.noise_schedulers import GaussianNoiseScheduler
+
+
+
 import numpy as np
 import torch
 import torchvision.transforms as transforms
@@ -16,7 +23,11 @@ from datasets import (
     get_dataset,
     get_forget_dataset,
     inverse_data_transform,
+    get_mimic_forget_dataset,   
+    get_mimic_remain_dataset,
 )
+import torch.nn.utils as utils
+import torch.nn.functional as F
 from functions import create_class_labels, cycle, get_optimizer
 from functions.denoising import generalized_steps_conditional
 from functions.losses import loss_registry_conditional
@@ -479,144 +490,105 @@ class Diffusion(object):
                 self.sample_visualization(test_model, step, args.cond_scale)
                 del test_model
 
-    def saliency_unlearn(self):
-        args, config = self.args, self.config
+    # def saliency_unlearn(self):
+    #     import copy, time, torch.nn.functional as F
+    #     from torch.autograd import grad
 
-        D_remain_loader, D_forget_loader = get_forget_dataset(
-            args, config, args.label_to_forget
-        )
-        D_remain_iter = cycle(D_remain_loader)
-        D_forget_iter = cycle(D_forget_loader)
+    #     args, config = self.args, self.config
 
-        if args.mask_path:
-            mask = torch.load(args.mask_path)
-        else:
-            mask = None
+    #     # === Load datasets ===
+    #     D_remain_loader, D_forget_loader = get_forget_dataset(
+    #         args, config, args.label_to_forget
+    #     )
+    #     D_remain_iter = cycle(D_remain_loader)
+    #     D_forget_iter = cycle(D_forget_loader)
 
-        print("Loading checkpoints {}".format(args.ckpt_folder))
+    #     # === Load mask if available ===
+    #     mask = torch.load(args.mask_path) if args.mask_path else None
 
-        model = Conditional_Model(config)
-        states = torch.load(
-            os.path.join(args.ckpt_folder, "ckpts/ckpt.pth"),
-            map_location=self.device,
-        )
-        model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
-        model.load_state_dict(states[0], strict=True)
-        optimizer = get_optimizer(config, model.parameters())
-        criteria = torch.nn.MSELoss()
+    #     # === Load Medfusion model ===
+    #     print("Loading Medfusion checkpoint:", args.ckpt_folder)
+    #     model = DiffusionPipeline.load_from_checkpoint(
+    #         os.path.join(args.ckpt_folder, "last.ckpt")
+    #     ).to(self.device)
+    #     model.eval()
 
-        if self.config.model.ema:
-            ema_helper = EMAHelper(mu=config.model.ema_rate)
-            ema_helper.register(model)
-            ema_helper.load_state_dict(states[-1])
-            # model = ema_helper.ema_copy(model_no_ema)
-        else:
-            ema_helper = None
+    #     vae = model.latent_embedder
+    #     vae.eval()
+    #     noise_estimator = model.noise_estimator
+    #     noise_scheduler = model.noise_scheduler
 
-        model.train()
-        start = time.time()
-        for step in range(0, self.config.training.n_iters):
-            model.train()
+    #     optimizer = torch.optim.Adam(noise_estimator.parameters(), lr=config.optim.lr)
+    #     mse = torch.nn.MSELoss()
 
-            # remain stage
-            remain_x, remain_c = next(D_remain_iter)
-            n = remain_x.size(0)
-            remain_x = remain_x.to(self.device)
-            remain_x = data_transform(self.config, remain_x)
-            e = torch.randn_like(remain_x)
-            b = self.betas
+    #     start = time.time()
+    #     for step in range(config.training.n_iters):
+    #         model.train()
 
-            t = torch.randint(low=0, high=self.num_timesteps, size=(n // 2 + 1,)).to(
-                self.device
-            )
-            t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
-            remain_loss = loss_registry_conditional[config.model.type](
-                model, remain_x, t, remain_c, e, b
-            )
+    #         # === RETAIN STAGE ===
+    #         x_retain, y_retain = next(D_remain_iter)
+    #         x_retain = x_retain.to(self.device)
+    #         y_retain = y_retain.to(self.device)
 
-            # forget stage
-            forget_x, forget_c = next(D_forget_iter)
+    #         with torch.no_grad():
+    #             z_retain = vae.encode(x_retain)
 
-            n = forget_x.size(0)
-            forget_x = forget_x.to(self.device)
-            forget_x = data_transform(self.config, forget_x)
-            e = torch.randn_like(forget_x)
-            b = self.betas
+    #         t_retain = torch.randint(0, noise_scheduler.T, (x_retain.size(0),), device=self.device)
+    #         x_t_retain, _, _ = noise_scheduler.sample(z_retain, t=t_retain)
+    #         pred_retain, _ = noise_estimator(x_t_retain, t_retain, condition=y_retain, self_cond=None)
+    #         retain_loss = mse(pred_retain, x_t_retain)
 
-            t = torch.randint(low=0, high=self.num_timesteps, size=(n // 2 + 1,)).to(
-                self.device
-            )
-            t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
+    #         # === FORGET STAGE ===
+    #         x_forget, y_forget = next(D_forget_iter)
+    #         x_forget = x_forget.to(self.device)
+    #         y_forget = y_forget.to(self.device)
+    #         x_forget.requires_grad = True
 
-            if args.method == "ga":
-                forget_loss = -loss_registry_conditional[config.model.type](
-                    model, forget_x, t, forget_c, e, b
-                )
+    #         z_forget = vae.encode(x_forget)
+    #         t_forget = torch.randint(0, noise_scheduler.T, (x_forget.size(0),), device=self.device)
+    #         x_t_forget, _, _ = noise_scheduler.sample(z_forget, t=t_forget)
 
-            else:
-                a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
-                forget_x = forget_x * a.sqrt() + e * (1.0 - a).sqrt()
+    #         pred_forget, _ = noise_estimator(x_t_forget, t_forget, condition=y_forget, self_cond=None)
+    #         forget_loss_base = mse(pred_forget, x_t_forget)
 
-                output = model(forget_x, t.float(), forget_c, mode="train")
+    #         grads = grad(forget_loss_base, x_forget, create_graph=True)[0]
+    #         saliency_loss = grads.abs().mean()
 
-                if args.method == "rl":
-                    pseudo_c = torch.full(
-                        forget_c.shape,
-                        (args.label_to_forget + 1) % 10,
-                        device=forget_c.device,
-                    )
-                    pseudo = model(forget_x, t.float(), pseudo_c, mode="train").detach()
-                    forget_loss = criteria(pseudo, output)
+    #         # === Combine losses ===
+    #         total_loss = saliency_loss + args.alpha * retain_loss
 
-            loss = forget_loss + args.alpha * remain_loss
+    #         # === Logging ===
+    #         if (step + 1) % config.training.log_freq == 0:
+    #             end = time.time()
+    #             print(f"[Step {step}] retain: {retain_loss.item():.4f}, saliency: {saliency_loss.item():.4f}, total: {total_loss.item():.4f}, time: {end - start:.2f}s")
+    #             start = time.time()
 
-            if (step + 1) % self.config.training.log_freq == 0:
-                end = time.time()
-                logging.info(f"step: {step}, loss: {loss.item()}, time: {end-start}")
-                start = time.time()
+    #         optimizer.zero_grad()
+    #         total_loss.backward()
 
-            optimizer.zero_grad()
-            loss.backward()
+    #         # === Apply saliency mask ===
+    #         if mask:
+    #             for name, param in noise_estimator.named_parameters():
+    #                 if param.grad is not None and name in mask:
+    #                     param.grad *= mask[name].to(param.device)
 
-            try:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.optim.grad_clip
-                )
-            except Exception:
-                pass
+    #         optimizer.step()
 
-            if mask:
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        param.grad *= mask[name].to(param.grad.device)
-            optimizer.step()
+    #         # === Save checkpoint and generate samples ===
+    #         if (step + 1) % config.training.snapshot_freq == 0:
+    #             states = [
+    #                 noise_estimator.state_dict(),
+    #                 optimizer.state_dict(),
+    #                 step,
+    #             ]
+    #             torch.save(states, os.path.join(config.ckpt_dir, "ckpt.pth"))
 
-            if self.config.model.ema:
-                ema_helper.update(model)
+    #             # Visualize samples
+    #             test_model = copy.deepcopy(noise_estimator)
+    #             test_model.eval()
+    #             self.sample_visualization(test_model, step, args.cond_scale)
+    #             del test_model
 
-            if (step + 1) % self.config.training.snapshot_freq == 0:
-                states = [
-                    model.state_dict(),
-                    optimizer.state_dict(),
-                    step,
-                ]
-                if self.config.model.ema:
-                    states.append(ema_helper.state_dict())
-
-                torch.save(
-                    states,
-                    os.path.join(self.config.ckpt_dir, "ckpt.pth"),
-                )
-
-                test_model = (
-                    ema_helper.ema_copy(model)
-                    if self.config.model.ema
-                    else copy.deepcopy(model)
-                )
-                test_model.eval()
-                self.sample_visualization(test_model, step, args.cond_scale)
-                del test_model
 
     def load_ema_model(self):
         model = Conditional_Model(self.config)
@@ -932,108 +904,63 @@ class Diffusion(object):
 
     def generate_mask(self):
         args, config = self.args, self.config
-        logging.info(
-            f"Generating mask of diffusion to achieve gradient sparsity. Gamma: {config.training.gamma}, lambda: {config.training.lmbda}"
-        )
 
-        _, D_forget_loader = get_forget_dataset(args, config, args.label_to_forget)
-        
-        print("Loading checkpoints {}".format(args.ckpt_folder))
-        model = Conditional_Model(config)
-        states = torch.load(
-            os.path.join(args.ckpt_folder, "ckpts/ckpt.pth"),
-            map_location=self.device,
-        )
-        model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
-        model.load_state_dict(states[0], strict=True)
+        # === Load forget set with labels ===
+        _, D_forget_loader = get_mimic_forget_dataset(args, config)
 
-        optimizer = get_optimizer(config, model.parameters())
+        print("Loading Medfusion diffusion UNet weights and VAE")
 
-        gradients = {}
-        for name, param in model.named_parameters():
-            gradients[name] = 0
+        # === Load VAE ===
+        vae = VAE.load_from_checkpoint(args.vae_ckpt).to(self.device)
+        vae.eval()
 
-        model.eval()
+        # === Instantiate and load the diffusion UNet ===
+        noise_estimator = UNet(**config.noise_estimator_kwargs).to(self.device)
+        noise_estimator.load_state_dict(torch.load(args.diffusion_ckpt))
+        noise_estimator.eval()
 
-        for x, forget_c in D_forget_loader:
-            n = x.size(0)
+        # === Instantiate the noise scheduler ===
+        noise_scheduler = GaussianNoiseScheduler(**config.noise_scheduler_kwargs)
+
+        # === Optimizer (not strictly needed, but used for zero_grad)
+        optimizer = torch.optim.Adam(noise_estimator.parameters(), lr=config.optim.lr)
+
+        # === Initialize gradient containers ===
+        gradients = {
+            name: torch.zeros_like(param) for name, param in noise_estimator.named_parameters()
+        }
+
+        # === Compute saliency gradients over forget set ===
+        for x, y in tqdm.tqdm(D_forget_loader, desc="Generating saliency gradients"):
             x = x.to(self.device)
-            x = data_transform(self.config, x)
-            e = torch.randn_like(x)
-            b = self.betas
+            y = y.to(self.device)
+            x.requires_grad = True
 
-            # antithetic sampling
-            t = torch.randint(low=0, high=self.num_timesteps, size=(n // 2 + 1,)).to(
-                self.device
-            )
-            t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
+            z = vae.encode(x)
+            t = torch.randint(0, noise_scheduler.T, (x.size(0),), device=self.device)
+            x_t, _, _ = noise_scheduler.sample(z, t)
 
-            # loss 1
-            a = (1 - b).cumprod(dim=0).index_select(0, t).view(-1, 1, 1, 1)
-            x = x * a.sqrt() + e * (1.0 - a).sqrt()
-            output = model(
-                x, t.float(), forget_c, cond_scale=args.cond_scale, mode="test"
-            )
+            pred, _ = noise_estimator(x_t, t, condition=y)
 
-            # https://github.com/clear-nus/selective-amnesia/blob/a7a27ab573ba3be77af9e7aae4a3095da9b136ac/ddpm/models/diffusion.py#L338
-            loss = (e - output).square().sum(dim=(1, 2, 3)).mean(dim=0)
-
+            loss = F.mse_loss(pred, x_t)
             optimizer.zero_grad()
             loss.backward()
 
-            try:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), config.optim.grad_clip
-                )
-            except Exception:
-                pass
+            for name, param in noise_estimator.named_parameters():
+                if param.grad is not None:
+                    gradients[name] += param.grad.data.abs()
 
-            with torch.no_grad():
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        gradient = param.grad.data.cpu()
-                        gradients[name] += gradient
+        # === Flatten and threshold ===
+        flat_grads = torch.cat([g.flatten() for g in gradients.values()])
+        threshold = torch.quantile(flat_grads, 1 - args.mask_ratio)
 
-        with torch.no_grad():
+        mask = {
+            name: (g >= threshold).float() for name, g in gradients.items()
+        }
 
-            for name in gradients:
-                gradients[name] = torch.abs_(gradients[name])
-
-            mask_path = os.path.join('results/cifar10/mask', str(args.label_to_forget))
-            os.makedirs(mask_path, exist_ok=True)
-
-            threshold_list = [0.5]
-            for i in threshold_list:
-                print(i)
-                sorted_dict_positions = {}
-                hard_dict = {}
-
-                # Concatenate all tensors into a single tensor
-                all_elements = - torch.cat(
-                    [tensor.flatten() for tensor in gradients.values()]
-                )
-
-                # Calculate the threshold index for the top 10% elements
-                threshold_index = int(len(all_elements) * i)
-
-                # Calculate positions of all elements
-                positions = torch.argsort(all_elements)
-                ranks = torch.argsort(positions)
-
-                start_index = 0
-                for key, tensor in gradients.items():
-                    num_elements = tensor.numel()
-                    tensor_ranks = ranks[start_index : start_index + num_elements]
-
-                    sorted_positions = tensor_ranks.reshape(tensor.shape)
-                    sorted_dict_positions[key] = sorted_positions
-
-                    # Set the corresponding elements to 1
-                    threshold_tensor = torch.zeros_like(tensor_ranks)
-                    threshold_tensor[tensor_ranks < threshold_index] = 1
-                    threshold_tensor = threshold_tensor.reshape(tensor.shape)
-                    hard_dict[key] = threshold_tensor
-                    start_index += num_elements
-
-                torch.save(hard_dict, os.path.join(mask_path, f'with_{str(i)}.pt'))
+        # === Save mask ===
+        mask_dir = os.path.join("results", "medfusion", "mask", str(args.label_to_forget))
+        os.makedirs(mask_dir, exist_ok=True)
+        mask_path = os.path.join(mask_dir, f"with_{args.mask_ratio}.pt")
+        torch.save(mask, mask_path)
+        print(f"✅ Saved saliency mask at: {mask_path}")

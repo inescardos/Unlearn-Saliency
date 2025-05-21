@@ -1,11 +1,12 @@
 model:
   var_type: fixedsmall
   ema: false
-  type: pipeline
+  type: pipeline 
+
 
 diffusion:
   beta_schedule: linear
-  beta_start: 0.0001
+  beta_start: 0.002
   beta_end: 0.02
   num_diffusion_timesteps: 1000
 
@@ -25,3 +26,33 @@ data:
   image_size: 256
   channels: 3
   n_classes: 2
+  forget_csv: "data/forget_set.csv"  # <- NEW
+  batch_size: 32
+  num_workers: 4
+
+vae_ckpt: "vae_runs/2025_03_27_212914/last.ckpt"         # <- NEW
+diffusion_ckpt: "checkpoints/diffusion.ckpt"             # <- NEW
+
+noise_estimator_kwargs:  # <- NEW (copied from your training script)
+  in_ch: 8
+  out_ch: 8
+  spatial_dims: 2
+  hid_chs: [256, 256, 512, 1024]
+  kernel_sizes: [3, 3, 3, 3]
+  strides: [1, 2, 2, 2]
+  time_embedder: !!python/name:medical_diffusion.models.embedders.TimeEmbbeding
+  time_embedder_kwargs:
+    emb_dim: 1024
+  cond_embedder: !!python/name:medical_diffusion.models.embedders.LabelEmbedder
+  cond_embedder_kwargs:
+    emb_dim: 1024
+    num_classes: 2
+  deep_supervision: false
+  use_res_block: true
+  use_attention: none
+
+noise_scheduler_kwargs:  # <- NEW (copied from training)
+  timesteps: 1000
+  beta_start: 0.002
+  beta_end: 0.02
+  schedule_strategy: scaled_linear

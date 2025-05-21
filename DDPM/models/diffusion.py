@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 from einops import rearrange, repeat
 
-
 def prob_mask_like(shape, prob, device):
     if prob == 1:
         return torch.ones(shape, device=device, dtype=torch.bool)

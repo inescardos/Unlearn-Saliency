@@ -10,6 +10,24 @@ from torchvision.datasets import CIFAR10, STL10, ImageFolder
 
 IMAGE_EXTENSIONS = {"bmp", "jpg", "jpeg", "pgm", "png", "ppm", "tif", "tiff", "webp"}
 
+class ForgetDatasetFromCSV(Dataset):
+    def __init__(self, csv_path, transform=None):
+        df = pd.read_csv(csv_path)
+        self.image_paths = df['image_path'].tolist()
+        self.labels = df['cardiomegaly_label'].tolist()
+        self.transform = transform or transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        image = Image.open(self.image_paths[idx]).convert('RGB')
+        label = int(self.labels[idx])
+        return self.transform(image), label
+
 
 class Crop(object):
     def __init__(self, x1, x2, y1, y2):
@@ -115,6 +133,26 @@ def all_but_one_class_path_dataset(config, data_path, label_to_drop):
     )
 
     return train_loader
+
+
+def get_mimic_remain_dataset(args, config, label_to_drop):
+    """
+    Returns mimic dataset with all classes but one.
+    """
+    return False
+
+def get_mimic_forget_dataset(args, config):
+    dataset = ForgetDatasetFromCSV(csv_path=config.data.forget_csv)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=config.data.batch_size,
+        shuffle=False,
+        num_workers=config.data.num_workers,
+        pin_memory=True
+    )
+
+    return None, loader  # return as (retain_loader, forget_loader)
 
 
 def get_forget_dataset(args, config, label_to_drop):
